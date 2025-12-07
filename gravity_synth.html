@@ -1,0 +1,359 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Gravity Synth 🎹</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050505; /* 深黑背景 */
+            font-family: 'Courier New', monospace;
+            user-select: none;
+        }
+        canvas { display: block; }
+        #overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: rgba(0,0,0,0.8);
+            color: #00ffcc;
+            z-index: 10;
+            transition: opacity 0.5s;
+        }
+        h1 { font-size: 40px; text-shadow: 0 0 10px #00ffcc; margin-bottom: 20px; }
+        p { color: #fff; font-size: 18px; margin-bottom: 30px; }
+        button {
+            padding: 15px 40px;
+            font-size: 20px;
+            background: transparent;
+            color: #00ffcc;
+            border: 2px solid #00ffcc;
+            border-radius: 30px;
+            cursor: pointer;
+            box-shadow: 0 0 15px #00ffcc;
+            transition: all 0.3s;
+        }
+        button:hover { background: #00ffcc; color: #000; }
+        #controls {
+            position: absolute;
+            top: 20px; left: 20px;
+            color: rgba(255,255,255,0.5);
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        <h1>Gravity Music Lab</h1>
+        <p>划动鼠标画线 · 球体撞击发声 · 构建你的旋律</p>
+        <button id="startBtn">开始演奏 / Start</button>
+    </div>
+
+    <div id="controls">
+        [左键拖动] 画线 (Draw Line)<br>
+        [右键点击] 清空画布 (Clear)<br>
+        [Space] 暂停/生成 (Pause/Spawn)
+    </div>
+
+    <canvas id="canvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        let width, height;
+
+        // --- 音频系统 (Web Audio API) ---
+        let audioCtx;
+        // 五声音阶频率 (Pentatonic Scale) - 无论怎么乱弹都好听
+        const scale = [
+            130.81, 146.83, 164.81, 196.00, 220.00, // C3, D3, E3, G3, A3
+            261.63, 293.66, 329.63, 392.00, 440.00, // C4...
+            523.25, 587.33, 659.25, 783.99, 880.00  // C5...
+        ];
+
+        function initAudio() {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        function playSound(velocity, yPos) {
+            if (!audioCtx) return;
+
+            // 根据高度决定音高 (位置越高，音调越高)
+            const pitchIndex = Math.floor((1 - yPos / height) * scale.length);
+            const frequency = scale[Math.max(0, Math.min(scale.length - 1, pitchIndex))];
+
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+
+            // 选用正弦波或三角波，声音温润
+            osc.type = 'sine'; 
+            osc.frequency.setValueAtTime(frequency, audioCtx.currentTime);
+
+            // 根据撞击速度决定音量
+            const vol = Math.min(velocity * 0.1, 0.5);
+            gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5); // 0.5秒淡出
+
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.5);
+        }
+
+        // --- 物理系统 ---
+        const gravity = 0.2;
+        const balls = [];
+        const lines = [];
+        let particles = []; // 碰撞火花
+
+        class Ball {
+            constructor(x, y) {
+                this.x = x; this.y = y;
+                this.vx = (Math.random() - 0.5) * 4;
+                this.vy = 0;
+                this.radius = 5;
+                this.color = `hsl(${Math.random()*360}, 100%, 70%)`;
+                this.dead = false;
+            }
+            update() {
+                this.vy += gravity;
+                this.x += this.vx;
+                this.y += this.vy;
+
+                // 简单的空气阻力
+                this.vx *= 0.999;
+                this.vy *= 0.999;
+
+                // 边界检测
+                if (this.x < 0 || this.x > width) this.vx *= -0.8;
+                if (this.y > height + 50) this.dead = true;
+
+                // 线条碰撞检测
+                for (let line of lines) {
+                    this.checkLineCollision(line);
+                }
+            }
+            checkLineCollision(line) {
+                // 向量计算：点到线段的距离
+                const dx = line.x2 - line.x1;
+                const dy = line.y2 - line.y1;
+                const lenSq = dx*dx + dy*dy;
+                let t = ((this.x - line.x1) * dx + (this.y - line.y1) * dy) / lenSq;
+                t = Math.max(0, Math.min(1, t)); // 限制在线段范围内
+
+                const closestX = line.x1 + t * dx;
+                const closestY = line.y1 + t * dy;
+
+                const distX = this.x - closestX;
+                const distY = this.y - closestY;
+                const dist = Math.sqrt(distX*distX + distY*distY);
+
+                if (dist < this.radius + line.width/2) {
+                    // 发生碰撞
+                    // 计算法线
+                    const nx = -dy; // 简化的法线计算
+                    const ny = dx;
+                    const nLen = Math.sqrt(nx*nx + ny*ny);
+                    const normalX = nx / nLen;
+                    const normalY = ny / nLen;
+
+                    // 只有当球朝向线条撞击时才反弹 (点积 < 0)
+                    const dot = this.vx * normalX + this.vy * normalY;
+
+                    // 修正反弹逻辑，处理线条双面
+                    // 这里简化：直接反转速度分量并添加弹力
+                    // 更严谨的做法是反射向量 V_new = V - 2(V.N)N
+
+                    // 简单反射算法
+                    if (prevDist > dist) { // 确保是进近状态
+                        // 播放声音 (速度越大声音越大)
+                        const impactSpeed = Math.sqrt(this.vx*this.vx + this.vy*this.vy);
+                        if (impactSpeed > 1) {
+                            playSound(impactSpeed, this.y);
+                            createParticles(this.x, this.y, this.color);
+                            line.pulse = 10; // 线条发光
+                        }
+
+                        // 反射公式
+                        const dot2 = 2 * (this.vx * normalX + this.vy * normalY);
+                        this.vx = (this.vx - dot2 * normalX) * 0.7; // 0.7是弹性系数，能量损耗
+                        this.vy = (this.vy - dot2 * normalY) * 0.7;
+
+                        // 防止陷入线条内部，推出来一点
+                        this.x += normalX * (this.radius - dist + 1);
+                        this.y += normalY * (this.radius - dist + 1);
+                    }
+                }
+            }
+            draw() {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI*2);
+                ctx.fillStyle = this.color;
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = this.color;
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            }
+        }
+
+        // 记录上一帧的距离，用于防穿透判断
+        let prevDist = 100; 
+
+        class Line {
+            constructor(x1, y1, x2, y2) {
+                this.x1 = x1; this.y1 = y1;
+                this.x2 = x2; this.y2 = y2;
+                this.width = 4;
+                this.color = '#00ffcc';
+                this.pulse = 0; // 撞击时的发光强度
+            }
+            draw() {
+                ctx.beginPath();
+                ctx.moveTo(this.x1, this.y1);
+                ctx.lineTo(this.x2, this.y2);
+                ctx.lineWidth = this.width + this.pulse;
+
+                // 颜色渐变处理
+                const r = Math.floor(this.pulse * 20);
+                ctx.strokeStyle = `rgb(${r}, ${255}, ${204 + r})`;
+                ctx.shadowBlur = this.pulse * 2 + 5;
+                ctx.shadowColor = '#00ffcc';
+
+                ctx.lineCap = 'round';
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+
+                if (this.pulse > 0) this.pulse *= 0.9; // 发光衰减
+            }
+        }
+
+        class Particle {
+            constructor(x, y, color) {
+                this.x = x; this.y = y;
+                this.vx = (Math.random() - 0.5) * 5;
+                this.vy = (Math.random() - 0.5) * 5;
+                this.life = 1.0;
+                this.color = color;
+            }
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.life -= 0.05;
+            }
+            draw() {
+                ctx.globalAlpha = Math.max(0, this.life);
+                ctx.fillStyle = this.color;
+                ctx.fillRect(this.x, this.y, 2, 2);
+                ctx.globalAlpha = 1;
+            }
+        }
+
+        function createParticles(x, y, color) {
+            for(let i=0; i<5; i++) particles.push(new Particle(x, y, color));
+        }
+
+        // --- 交互逻辑 ---
+        let isDrawing = false;
+        let startX, startY;
+        let mouseX, mouseY;
+
+        function resize() {
+            width = canvas.width = window.innerWidth;
+            height = canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+
+        canvas.addEventListener('mousedown', e => {
+            if (e.button === 0) { // 左键
+                isDrawing = true;
+                startX = e.clientX;
+                startY = e.clientY;
+            }
+        });
+
+        canvas.addEventListener('mousemove', e => {
+            mouseX = e.clientX;
+            mouseY = e.clientY;
+        });
+
+        canvas.addEventListener('mouseup', e => {
+            if (isDrawing && e.button === 0) {
+                isDrawing = false;
+                // 添加新线条
+                const dist = Math.sqrt((e.clientX-startX)**2 + (e.clientY-startY)**2);
+                if (dist > 10) { // 太短的线不画
+                    lines.push(new Line(startX, startY, e.clientX, e.clientY));
+                }
+            }
+        });
+
+        // 右键清除
+        canvas.addEventListener('contextmenu', e => {
+            e.preventDefault();
+            lines.length = 0; // 清空线条
+        });
+
+        // --- 主循环 ---
+        function loop() {
+            ctx.fillStyle = 'rgba(5, 5, 5, 0.3)'; // 拖尾效果
+            ctx.fillRect(0, 0, width, height);
+
+            // 生成球体 (每隔几帧)
+            if (Math.random() > 0.95 && balls.length < 50) {
+                balls.push(new Ball(width/2 + (Math.random()-0.5)*20, 0));
+            }
+
+            // 更新绘制球
+            for (let i = balls.length - 1; i >= 0; i--) {
+                let b = balls[i];
+                b.update();
+                b.draw();
+                if (b.dead) balls.splice(i, 1);
+            }
+
+            // 更新绘制线
+            lines.forEach(l => l.draw());
+
+            // 绘制正在画的线
+            if (isDrawing) {
+                ctx.beginPath();
+                ctx.moveTo(startX, startY);
+                ctx.lineTo(mouseX, mouseY);
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+
+            // 粒子特效
+            for (let i = particles.length - 1; i >= 0; i--) {
+                let p = particles[i];
+                p.update();
+                p.draw();
+                if (p.life <= 0) particles.splice(i, 1);
+            }
+
+            requestAnimationFrame(loop);
+        }
+
+        // --- 启动 ---
+        document.getElementById('startBtn').addEventListener('click', () => {
+            initAudio();
+            document.getElementById('overlay').style.opacity = 0;
+            setTimeout(() => {
+                document.getElementById('overlay').style.display = 'none';
+            }, 500);
+            resize();
+            loop();
+        });
+
+    </script>
+</body>
+</html>
